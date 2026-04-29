@@ -21,3 +21,9 @@ Read SPEC.md fully before writing any code.
 
 ## If Unsure
 Re-read the relevant section of SPEC.md before proceeding.
+
+## Timeouts
+If any shell command runs for more than 3 minutes without
+producing new output, consider it timed out. Kill it with
+ctrl+c, note what timed out, and proceed to the next step.
+Do not retry the same hanging command more than once.
