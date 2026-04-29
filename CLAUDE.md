@@ -27,3 +27,7 @@ If any shell command runs for more than 3 minutes without
 producing new output, consider it timed out. Kill it with
 ctrl+c, note what timed out, and proceed to the next step.
 Do not retry the same hanging command more than once.
+
+## Memory
+Run `mempalace wake-up` at the start of every session before
+reading SPEC.md. This loads relevant context from past sessions.
