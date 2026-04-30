@@ -87,7 +87,7 @@ fn encode_chunk<R: Read>(
         let region = pixels
             .get_mut(start..start + n)
             .ok_or(Error::Internal)?;
-        reader.read_exact(region)?;
+        reader.read_exact(region).map_err(Error::ReadIo)?;
         cipher.apply(region);
         mac.update(region);
         written += n;
@@ -355,7 +355,7 @@ fn decrypt_chunk_payload<W: Write>(
             .ok_or(Error::Format)?;
         scratch[..n].copy_from_slice(src);
         cipher.apply(&mut scratch[..n]);
-        out.write_all(&scratch[..n])?;
+        out.write_all(&scratch[..n]).map_err(Error::WriteIo)?;
         written += n;
     }
     Ok(())
@@ -576,6 +576,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let result = decode_multi(&png_refs, pw("k"), &mut out);
         assert!(matches!(result, Err(Error::Verification)));
+        assert_eq!(result.unwrap_err().user_message(), "Authentication failed.");
     }
 
     #[test]

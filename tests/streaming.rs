@@ -65,6 +65,23 @@ fn stream_wrong_password_fails() {
 }
 
 #[test]
+#[ignore = "slow: ~30s; encodes 100MB → 2 chunks at 7680x4320"]
+fn stream_roundtrip_100mb_via_multi() {
+    use imgutil::{decode_multi, encode_multi};
+
+    let payload = deterministic_payload(100 * 1024 * 1024, 100);
+    let pngs =
+        encode_multi(Cursor::new(&payload), payload.len() as u64, pw("100mb")).unwrap();
+    assert!(pngs.len() >= 2, "100MB should require at least 2 chunks");
+
+    let refs: Vec<&[u8]> = pngs.iter().map(|v| v.as_slice()).collect();
+    let mut out: Vec<u8> = Vec::new();
+    decode_multi(&refs, pw("100mb"), &mut out).unwrap();
+    assert_eq!(payload.len(), out.len());
+    assert_eq!(payload, out);
+}
+
+#[test]
 fn stream_tampered_ciphertext_rejected_before_any_output() {
     let payload = deterministic_payload(50_000, 9);
     let mut png = encode_stream(Cursor::new(&payload), payload.len() as u64, pw("p")).unwrap();
