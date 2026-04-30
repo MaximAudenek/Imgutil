@@ -10,6 +10,7 @@ use crate::error::Error;
 
 const SHRED_CHUNK: usize = 64 * 1024;
 const MAX_CHUNK_FILES: usize = 9999;
+const DEFAULT_CHUNK_RES: (u32, u32) = (7680, 4320);
 
 fn chunk_filename(idx: u32) -> String {
     format!("chunk_{:04}.png", idx + 1)
@@ -21,6 +22,19 @@ pub fn encode_file_to_dir(
     out_dir: &Path,
     password: Zeroizing<Vec<u8>>,
 ) -> Result<u32, Error> {
+    encode_file_to_dir_with_progress(in_path, out_dir, password, |_, _| {})
+}
+
+#[inline(never)]
+pub fn encode_file_to_dir_with_progress<F>(
+    in_path: &Path,
+    out_dir: &Path,
+    password: Zeroizing<Vec<u8>>,
+    mut on_chunk_written: F,
+) -> Result<u32, Error>
+where
+    F: FnMut(u32, u32),
+{
     if !out_dir.is_dir() {
         return Err(Error::InvalidArgs);
     }
@@ -29,19 +43,21 @@ pub fn encode_file_to_dir(
         return Err(Error::InvalidArgs);
     }
     let file_len = metadata.len();
-    let in_file = File::open(in_path).map_err(Error::ReadIo)?;
 
-    let pngs = codec::encode_multi(in_file, file_len, password)?;
-
-    for (i, _) in pngs.iter().enumerate() {
-        let p = out_dir.join(chunk_filename(i as u32));
+    // Pre-compute the chunk count and refuse if any target file already
+    // exists. Per SPEC.md: never silently overwrite.
+    let total_chunks = codec::compute_total_chunks(file_len, DEFAULT_CHUNK_RES)?;
+    for i in 0..total_chunks {
+        let p = out_dir.join(chunk_filename(i));
         if p.exists() {
             return Err(Error::InvalidArgs);
         }
     }
 
-    for (i, png) in pngs.iter().enumerate() {
-        let p = out_dir.join(chunk_filename(i as u32));
+    let in_file = File::open(in_path).map_err(Error::ReadIo)?;
+
+    let written = codec::encode_multi_streaming(in_file, file_len, password, |idx, total, png| {
+        let p = out_dir.join(chunk_filename(idx));
         let mut f = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -49,10 +65,11 @@ pub fn encode_file_to_dir(
             .map_err(Error::WriteIo)?;
         f.write_all(png).map_err(Error::WriteIo)?;
         f.sync_all().map_err(Error::WriteIo)?;
-    }
+        on_chunk_written(idx + 1, total);
+        Ok(())
+    })?;
 
-    let count: u32 = pngs.len().try_into().map_err(|_| Error::Internal)?;
-    Ok(count)
+    Ok(written)
 }
 
 fn read_pngs_from_dir(dir: &Path) -> Result<Vec<Zeroizing<Vec<u8>>>, Error> {
@@ -87,6 +104,19 @@ pub fn decode_dir_to_file(
     out_path: &Path,
     password: Zeroizing<Vec<u8>>,
 ) -> Result<(), Error> {
+    decode_dir_to_file_with_progress(in_dir, out_path, password, |_, _| {})
+}
+
+#[inline(never)]
+pub fn decode_dir_to_file_with_progress<F>(
+    in_dir: &Path,
+    out_path: &Path,
+    password: Zeroizing<Vec<u8>>,
+    on_chunk_written: F,
+) -> Result<(), Error>
+where
+    F: FnMut(u32, u32),
+{
     if !in_dir.is_dir() {
         return Err(Error::InvalidArgs);
     }
@@ -100,23 +130,9 @@ pub fn decode_dir_to_file(
     }
     let png_refs: Vec<&[u8]> = pngs_data.iter().map(|v| v.as_slice()).collect();
 
-    let mut out_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(out_path)
-        .map_err(Error::WriteIo)?;
-
-    match codec::decode_multi(&png_refs, password, &mut out_file) {
-        Ok(()) => {
-            out_file.sync_all().map_err(Error::WriteIo)?;
-            Ok(())
-        }
-        Err(e) => {
-            drop(out_file);
-            let _ = shred_and_delete(out_path);
-            Err(e)
-        }
-    }
+    decode_into_new_file(out_path, |f| {
+        codec::decode_multi_streaming(&png_refs, password, f, on_chunk_written)
+    })
 }
 
 #[inline(never)]
@@ -125,6 +141,19 @@ pub fn decode_file_to_file(
     out_path: &Path,
     password: Zeroizing<Vec<u8>>,
 ) -> Result<(), Error> {
+    decode_file_to_file_with_progress(in_png, out_path, password, |_, _| {})
+}
+
+#[inline(never)]
+pub fn decode_file_to_file_with_progress<F>(
+    in_png: &Path,
+    out_path: &Path,
+    password: Zeroizing<Vec<u8>>,
+    on_chunk_written: F,
+) -> Result<(), Error>
+where
+    F: FnMut(u32, u32),
+{
     if !in_png.is_file() {
         return Err(Error::InvalidArgs);
     }
@@ -138,13 +167,27 @@ pub fn decode_file_to_file(
     let png_data = Zeroizing::new(buf);
     let pngs: [&[u8]; 1] = [png_data.as_slice()];
 
+    decode_into_new_file(out_path, |out_f| {
+        codec::decode_multi_streaming(&pngs[..], password, out_f, on_chunk_written)
+    })
+}
+
+/// Open `out_path` exclusively (`create_new`), invoke `body`, then on success
+/// fsync; on error shred-and-delete the partial output before propagating the
+/// original error. The cleanup result is intentionally swallowed — surfacing
+/// it would create an information channel about whether the underlying
+/// filesystem was healthy at the moment of failure.
+fn decode_into_new_file<G>(out_path: &Path, body: G) -> Result<(), Error>
+where
+    G: FnOnce(&mut File) -> Result<(), Error>,
+{
     let mut out_file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(out_path)
         .map_err(Error::WriteIo)?;
 
-    match codec::decode_multi(&pngs[..], password, &mut out_file) {
+    match body(&mut out_file) {
         Ok(()) => {
             out_file.sync_all().map_err(Error::WriteIo)?;
             Ok(())
@@ -227,4 +270,3 @@ mod tests {
         assert!(matches!(result, Err(Error::WriteIo(_))));
     }
 }
-

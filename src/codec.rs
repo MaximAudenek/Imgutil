@@ -158,15 +158,27 @@ pub fn encode_multi<R: Read>(
 }
 
 #[inline(never)]
-pub(crate) fn encode_multi_with_res<R: Read>(
-    mut reader: R,
+pub fn encode_multi_streaming<R, F>(
+    reader: R,
     payload_len: u64,
     password: Zeroizing<Vec<u8>>,
+    emit: F,
+) -> Result<u32, Error>
+where
+    R: Read,
+    F: FnMut(u32, u32, &[u8]) -> Result<(), Error>,
+{
+    encode_multi_streaming_with_res(reader, payload_len, password, DEFAULT_CHUNK_RES, emit)
+}
+
+/// Returns total number of chunks the payload will produce at the given
+/// resolution, or an error if it would exceed MAX_CHUNKS.
+pub(crate) fn compute_total_chunks(
+    payload_len: u64,
     chunk_res: (u32, u32),
-) -> Result<Vec<Vec<u8>>, Error> {
+) -> Result<u32, Error> {
     let payload_len_usize: usize =
         payload_len.try_into().map_err(|_| Error::Capacity)?;
-
     if !resolution::is_standard(chunk_res.0, chunk_res.1) {
         return Err(Error::Internal);
     }
@@ -177,26 +189,43 @@ pub(crate) fn encode_multi_with_res<R: Read>(
     if chunk_payload_max == 0 {
         return Err(Error::Internal);
     }
-
-    let total_chunks_usize = if payload_len_usize == 0 {
+    let n = if payload_len_usize == 0 {
         1usize
     } else {
         payload_len_usize.div_ceil(chunk_payload_max)
     };
-    if total_chunks_usize > MAX_CHUNKS as usize {
+    if n > MAX_CHUNKS as usize {
         return Err(Error::Capacity);
     }
-    let total_chunks: u32 =
-        total_chunks_usize.try_into().map_err(|_| Error::Capacity)?;
+    n.try_into().map_err(|_| Error::Capacity)
+}
+
+#[inline(never)]
+pub(crate) fn encode_multi_streaming_with_res<R, F>(
+    mut reader: R,
+    payload_len: u64,
+    password: Zeroizing<Vec<u8>>,
+    chunk_res: (u32, u32),
+    mut emit: F,
+) -> Result<u32, Error>
+where
+    R: Read,
+    F: FnMut(u32, u32, &[u8]) -> Result<(), Error>,
+{
+    let payload_len_usize: usize =
+        payload_len.try_into().map_err(|_| Error::Capacity)?;
+    let total_chunks = compute_total_chunks(payload_len, chunk_res)?;
+    let chunk_cap = resolution::capacity_bytes(chunk_res.0, chunk_res.1);
+    let chunk_payload_max = chunk_cap
+        .checked_sub(HEADER_LEN + TAG_LEN)
+        .ok_or(Error::Internal)?;
 
     let mut session_id = [0u8; SESSION_ID_LEN];
     rand::thread_rng().fill_bytes(&mut session_id);
 
-    let mut pngs: Vec<Vec<u8>> = Vec::with_capacity(total_chunks_usize);
     let mut remaining = payload_len_usize;
-
     for chunk_idx in 0..total_chunks {
-        let is_last = chunk_idx as usize == total_chunks_usize - 1;
+        let is_last = chunk_idx as usize == total_chunks as usize - 1;
         let this_payload = if is_last { remaining } else { chunk_payload_max };
         let png = encode_chunk(
             &mut reader,
@@ -207,12 +236,32 @@ pub(crate) fn encode_multi_with_res<R: Read>(
             total_chunks,
             payload_len,
         )?;
-        pngs.push(png);
+        emit(chunk_idx, total_chunks, &png)?;
         remaining = remaining
             .checked_sub(this_payload)
             .ok_or(Error::Internal)?;
     }
+    Ok(total_chunks)
+}
 
+#[inline(never)]
+pub(crate) fn encode_multi_with_res<R: Read>(
+    reader: R,
+    payload_len: u64,
+    password: Zeroizing<Vec<u8>>,
+    chunk_res: (u32, u32),
+) -> Result<Vec<Vec<u8>>, Error> {
+    let mut pngs: Vec<Vec<u8>> = Vec::new();
+    encode_multi_streaming_with_res(
+        reader,
+        payload_len,
+        password,
+        chunk_res,
+        |_idx, _total, png| {
+            pngs.push(png.to_vec());
+            Ok(())
+        },
+    )?;
     Ok(pngs)
 }
 
@@ -401,8 +450,22 @@ pub fn decode_single(
 pub fn decode_multi<W: Write>(
     pngs: &[&[u8]],
     password: Zeroizing<Vec<u8>>,
-    mut out: W,
+    out: W,
 ) -> Result<(), Error> {
+    decode_multi_streaming(pngs, password, out, |_, _| {})
+}
+
+#[inline(never)]
+pub fn decode_multi_streaming<W, F>(
+    pngs: &[&[u8]],
+    password: Zeroizing<Vec<u8>>,
+    mut out: W,
+    mut on_chunk_written: F,
+) -> Result<(), Error>
+where
+    W: Write,
+    F: FnMut(u32, u32),
+{
     if pngs.len() > MAX_CHUNKS as usize {
         return Err(Error::Verification);
     }
@@ -485,6 +548,7 @@ pub fn decode_multi<W: Write>(
         }
     }
 
+    let total_chunks_u32 = total_chunks;
     for (i, c) in chunks.iter().enumerate() {
         decrypt_chunk_payload(
             pngs[c.png_idx],
@@ -493,6 +557,8 @@ pub fn decode_multi<W: Write>(
             per_chunk_payload[i],
             &mut out,
         )?;
+        let done: u32 = (i + 1).try_into().map_err(|_| Error::Internal)?;
+        on_chunk_written(done, total_chunks_u32);
     }
 
     Ok(())
