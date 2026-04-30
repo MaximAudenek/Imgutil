@@ -223,13 +223,38 @@ pub(crate) fn shred_and_delete(path: &Path) -> Result<(), Error> {
             f.write_all(&buf[..n]).map_err(Error::WriteIo)?;
             written += n as u64;
         }
-        f.sync_all().map_err(Error::WriteIo)?;
+        full_sync(&f).map_err(Error::WriteIo)?;
     }
     std::fs::remove_file(path).map_err(Error::WriteIo)?;
     if path.exists() {
         return Err(Error::Internal);
     }
     Ok(())
+}
+
+/// Best-effort durable flush. On macOS uses fcntl(F_FULLFSYNC) to push data
+/// past the disk's write cache to physical media — plain fsync(2) on APFS
+/// returns once data has reached the drive's volatile cache. Other platforms
+/// fall back to sync_all (fsync). For our purposes the difference matters
+/// only in the shred path: we want the random overwrite on durable storage
+/// before deleting the file.
+#[cfg(target_os = "macos")]
+fn full_sync(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    // F_FULLFSYNC = 51 on Darwin; libc exports it as a constant.
+    let ret = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
+    if ret < 0 {
+        // Fall back to fsync if F_FULLFSYNC is rejected (e.g. on filesystems
+        // that don't support it).
+        return file.sync_all();
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn full_sync(file: &File) -> std::io::Result<()> {
+    file.sync_all()
 }
 
 #[cfg(test)]

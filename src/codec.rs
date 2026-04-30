@@ -4,7 +4,7 @@ use rand::RngCore;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use crate::crypto::{self, NONCE_LEN, TAG_LEN};
+use crate::aead::{self, NONCE_LEN, TAG_LEN};
 use crate::error::Error;
 use crate::memory;
 use crate::png_io;
@@ -58,10 +58,10 @@ fn encode_chunk<R: Read>(
         pixels[i * 3 + 2] = gb[1];
     }
 
-    let key = crypto::derive_key(password, &nonce)?;
-    let (mut cipher, otk) = crypto::Cipher::new(&key, &nonce)?;
+    let key = aead::derive_key(password, &nonce)?;
+    let (mut cipher, otk) = aead::Cipher::new(&key, &nonce)?;
     drop(key);
-    let mut mac = crypto::Mac::new(&otk);
+    let mut mac = aead::Mac::new(&otk);
     drop(otk);
 
     let header_off = NONCE_PIXELS * 3;
@@ -75,7 +75,7 @@ fn encode_chunk<R: Read>(
         region[16..20].copy_from_slice(&chunk_idx.to_le_bytes());
         region[20..24].copy_from_slice(&total_chunks.to_le_bytes());
         region[24..32].copy_from_slice(&total_len_field.to_le_bytes());
-        cipher.apply(region);
+        cipher.apply(region)?;
         mac.update(region);
     }
     let mut written = HEADER_LEN;
@@ -88,7 +88,7 @@ fn encode_chunk<R: Read>(
             .get_mut(start..start + n)
             .ok_or(Error::Internal)?;
         reader.read_exact(region).map_err(Error::ReadIo)?;
-        cipher.apply(region);
+        cipher.apply(region)?;
         mac.update(region);
         written += n;
         remaining -= n;
@@ -102,7 +102,7 @@ fn encode_chunk<R: Read>(
             .get_mut(start..start + n)
             .ok_or(Error::Internal)?;
         rng.fill_bytes(region);
-        cipher.apply(region);
+        cipher.apply(region)?;
         mac.update(region);
         written += n;
         pad_remaining -= n;
@@ -304,12 +304,12 @@ fn open_chunk_meta(png: &[u8], password: &[u8]) -> Result<ChunkMeta, Error> {
         return Err(Error::Format);
     }
 
-    let key = crypto::derive_key(password, &nonce)?;
+    let key = aead::derive_key(password, &nonce)?;
 
     {
-        let (cipher_pass1, otk) = crypto::Cipher::new(&key, &nonce)?;
+        let (cipher_pass1, otk) = aead::Cipher::new(&key, &nonce)?;
         drop(cipher_pass1);
-        let mut mac = crypto::Mac::new(&otk);
+        let mut mac = aead::Mac::new(&otk);
         drop(otk);
         let ct_slice = pixels
             .get(header_off..tag_off)
@@ -329,14 +329,14 @@ fn open_chunk_meta(png: &[u8], password: &[u8]) -> Result<ChunkMeta, Error> {
         mac.verify(&tag_buf)?;
     }
 
-    let (mut cipher, _otk2) = crypto::Cipher::new(&key, &nonce)?;
+    let (mut cipher, _otk2) = aead::Cipher::new(&key, &nonce)?;
     let mut hbuf: Zeroizing<[u8; HEADER_LEN]> = Zeroizing::new([0u8; HEADER_LEN]);
     hbuf.copy_from_slice(
         pixels
             .get(header_off..header_off + HEADER_LEN)
             .ok_or(Error::Format)?,
     );
-    cipher.apply(&mut *hbuf);
+    cipher.apply(&mut *hbuf)?;
 
     let mut session_id = [0u8; SESSION_ID_LEN];
     session_id.copy_from_slice(&hbuf[0..SESSION_ID_LEN]);
@@ -388,9 +388,9 @@ fn decrypt_chunk_payload<W: Write>(
     }
     let header_off = NONCE_PIXELS * 3;
 
-    let (mut cipher, _otk) = crypto::Cipher::new(key, nonce)?;
+    let (mut cipher, _otk) = aead::Cipher::new(key, nonce)?;
     let mut throwaway: Zeroizing<[u8; HEADER_LEN]> = Zeroizing::new([0u8; HEADER_LEN]);
-    cipher.apply(&mut *throwaway);
+    cipher.apply(&mut *throwaway)?;
     drop(throwaway);
 
     let mut scratch: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0u8; CHUNK_BYTES]);
@@ -403,7 +403,7 @@ fn decrypt_chunk_payload<W: Write>(
             .get(payload_start + written..payload_start + written + n)
             .ok_or(Error::Format)?;
         scratch[..n].copy_from_slice(src);
-        cipher.apply(&mut scratch[..n]);
+        cipher.apply(&mut scratch[..n])?;
         out.write_all(&scratch[..n]).map_err(Error::WriteIo)?;
         written += n;
     }

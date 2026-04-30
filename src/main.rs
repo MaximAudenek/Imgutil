@@ -43,27 +43,65 @@ enum Cmd {
 }
 
 fn read_password() -> Result<Zeroizing<Vec<u8>>, Error> {
-    use std::io::{BufRead, IsTerminal};
+    use std::io::IsTerminal;
 
     let mut stderr = std::io::stderr();
     write!(stderr, "Password: ").map_err(Error::WriteIo)?;
     stderr.flush().map_err(Error::WriteIo)?;
 
-    let stdin = std::io::stdin();
-    let pw_string = if stdin.is_terminal() {
+    if std::io::stdin().is_terminal() {
         // Interactive: rpassword opens /dev/tty and disables echo.
-        rpassword::read_password().map_err(Error::ReadIo)?
-    } else {
-        // Piped: read a single line from stdin. (Echo handling is moot
-        // when there is no terminal.)
-        let mut buf = String::new();
-        stdin.lock().read_line(&mut buf).map_err(Error::ReadIo)?;
-        while matches!(buf.chars().last(), Some('\n') | Some('\r')) {
-            buf.pop();
+        let pw_string = rpassword::read_password().map_err(Error::ReadIo)?;
+        return Ok(Zeroizing::new(pw_string.into_bytes()));
+    }
+
+    // Piped stdin: read raw bytes directly so the password never sits in
+    // StdinLock's internal BufReader. On Unix, call read(2) on fd 0 directly.
+    // Non-Unix falls back to a stdin().lock().read line read.
+    read_password_piped()
+}
+
+#[cfg(unix)]
+fn read_password_piped() -> Result<Zeroizing<Vec<u8>>, Error> {
+    let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(64));
+    let mut byte = [0u8; 1];
+    loop {
+        // SAFETY: byte points to one valid writable byte for the duration of
+        // the read; fd 0 is stdin.
+        let n = unsafe {
+            libc::read(0, byte.as_mut_ptr() as *mut libc::c_void, 1)
+        };
+        if n < 0 {
+            return Err(Error::ReadIo(std::io::Error::last_os_error()));
         }
-        buf
-    };
-    Ok(Zeroizing::new(pw_string.into_bytes()))
+        if n == 0 {
+            // EOF
+            break;
+        }
+        if byte[0] == b'\n' || byte[0] == b'\r' {
+            break;
+        }
+        buf.push(byte[0]);
+    }
+    // Best-effort: zero the single-byte stack scratch via volatile write so
+    // the compiler can't elide the store as a dead assignment.
+    // SAFETY: byte is a valid writable u8.
+    unsafe {
+        std::ptr::write_volatile(byte.as_mut_ptr(), 0u8);
+    }
+    Ok(buf)
+}
+
+#[cfg(not(unix))]
+fn read_password_piped() -> Result<Zeroizing<Vec<u8>>, Error> {
+    use std::io::BufRead;
+    let stdin = std::io::stdin();
+    let mut buf = String::new();
+    stdin.lock().read_line(&mut buf).map_err(Error::ReadIo)?;
+    while matches!(buf.chars().last(), Some('\n') | Some('\r')) {
+        buf.pop();
+    }
+    Ok(Zeroizing::new(buf.into_bytes()))
 }
 
 fn progress_style() -> ProgressStyle {

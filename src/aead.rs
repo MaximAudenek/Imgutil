@@ -47,15 +47,23 @@ impl Cipher {
         let mut inner =
             ChaCha20::new_from_slices(key, &nonce[..12]).map_err(|_| Error::Internal)?;
         let mut block0 = Zeroizing::new([0u8; 64]);
-        inner.apply_keystream(&mut *block0);
+        // Use the fallible variant — `apply_keystream` calls `unwrap()` on
+        // the result, which embeds a Display string in the binary that
+        // matches the OPSEC strings check. The fallible call is dead-code
+        // friendly.
+        inner
+            .try_apply_keystream(&mut *block0)
+            .map_err(|_| Error::Internal)?;
         let mut otk = Zeroizing::new([0u8; POLY_KEY_LEN]);
         otk.copy_from_slice(&block0[..POLY_KEY_LEN]);
         Ok((Self { inner }, otk))
     }
 
     #[inline(never)]
-    pub fn apply(&mut self, buf: &mut [u8]) {
-        self.inner.apply_keystream(buf);
+    pub fn apply(&mut self, buf: &mut [u8]) -> Result<(), Error> {
+        self.inner
+            .try_apply_keystream(buf)
+            .map_err(|_| Error::Internal)
     }
 }
 
@@ -166,7 +174,7 @@ mod tests {
             let mut ours = plaintext.clone();
             let (mut cipher, otk) = Cipher::new(&key, &nonce).unwrap();
             let mut mac = Mac::new(&otk);
-            cipher.apply(&mut ours);
+            cipher.apply(&mut ours).unwrap();
             mac.update(&ours);
             let our_tag = mac.finalize();
 

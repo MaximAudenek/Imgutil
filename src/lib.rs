@@ -1,7 +1,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
+mod aead;
 mod codec;
-mod crypto;
 mod error;
 mod fs_ops;
 mod memory;
@@ -19,3 +19,12 @@ pub use fs_ops::{
 };
 
 pub use zeroize::Zeroizing;
+
+#[doc(hidden)]
+#[cfg(feature = "__fuzz")]
+pub mod __fuzz {
+    //! Direct access to internal entry points for the fuzz harnesses in
+    //! `fuzz/`. Gated behind the `__fuzz` feature; not part of the public
+    //! API.
+    pub use crate::png_io::read_pixels;
+}

@@ -1,0 +1,38 @@
+[package]
+name = "imgutil-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.imgutil]
+path = ".."
+features = ["__fuzz"]
+
+# Each fuzz target is a separate binary so cargo-fuzz can pick them by name.
+
+[[bin]]
+name = "png_parse"
+path = "fuzz_targets/png_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "single_decode"
+path = "fuzz_targets/single_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "multi_decode"
+path = "fuzz_targets/multi_decode.rs"
+test = false
+doc = false
+bench = false
