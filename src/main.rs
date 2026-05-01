@@ -166,6 +166,22 @@ fn progress_style() -> ProgressStyle {
 }
 
 fn generate(input: Option<PathBuf>, out_dir: &Path) -> Result<(), Error> {
+    // Pre-validate before prompting for the password and (for the stdin
+    // payload path) before reading any of stdin into a buffer. Without
+    // this the user types or pipes the entire payload only to be told
+    // "Invalid arguments." after the fact when fs_ops finally sees the
+    // bad out_dir or leftover chunk file. The fs_ops layer still does the
+    // authoritative checks for any direct library callers — these are CLI
+    // ergonomics on top.
+    if !out_dir.is_dir() {
+        return Err(Error::InvalidArgs);
+    }
+    if out_dir.join("chunk_0001.png").exists() {
+        // Every encode produces chunk_0001.png — if it's already there the
+        // encode is guaranteed to fail later. Catch it now.
+        return Err(Error::InvalidArgs);
+    }
+
     let stdin_is_payload = input.is_none();
     let password = read_password(stdin_is_payload)?;
     let mut bar: Option<ProgressBar> = None;
@@ -207,6 +223,24 @@ fn extract(
     out: &str,
 ) -> Result<(), Error> {
     let to_stdout = out == "-";
+
+    // Pre-validate input source and (for non-stdout) output path before
+    // prompting for the password. Same rationale as generate(): surface
+    // obvious typos before the user types a password.
+    if let Some(ref d) = in_dir
+        && !d.is_dir()
+    {
+        return Err(Error::InvalidArgs);
+    }
+    if let Some(ref f) = in_png
+        && !f.is_file()
+    {
+        return Err(Error::InvalidArgs);
+    }
+    if !to_stdout && Path::new(out).exists() {
+        return Err(Error::InvalidArgs);
+    }
+
     let password = read_password(false)?;
 
     if to_stdout {
