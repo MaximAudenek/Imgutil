@@ -14,8 +14,9 @@ pub use codec::{
 };
 pub use error::Error;
 pub use fs_ops::{
-    decode_dir_to_file, decode_dir_to_file_with_progress, decode_file_to_file,
-    decode_file_to_file_with_progress, encode_file_to_dir, encode_file_to_dir_with_progress,
+    decode_dir_to_file, decode_dir_to_file_with_progress, decode_dir_to_writer_with_progress,
+    decode_file_to_file, decode_file_to_file_with_progress, decode_file_to_writer_with_progress,
+    encode_file_to_dir, encode_file_to_dir_with_progress, encode_reader_to_dir_with_progress,
 };
 
 pub use zeroize::Zeroizing;

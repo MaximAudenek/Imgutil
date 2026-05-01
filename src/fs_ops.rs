@@ -30,23 +30,39 @@ pub fn encode_file_to_dir_with_progress<F>(
     in_path: &Path,
     out_dir: &Path,
     password: Zeroizing<Vec<u8>>,
-    mut on_chunk_written: F,
+    on_chunk_written: F,
 ) -> Result<u32, Error>
 where
     F: FnMut(u32, u32),
 {
-    if !out_dir.is_dir() {
-        return Err(Error::InvalidArgs);
-    }
     let metadata = std::fs::metadata(in_path).map_err(Error::ReadIo)?;
     if !metadata.is_file() {
         return Err(Error::InvalidArgs);
     }
     let file_len = metadata.len();
+    let in_file = File::open(in_path).map_err(Error::ReadIo)?;
+    encode_reader_to_dir_with_progress(in_file, file_len, out_dir, password, on_chunk_written)
+}
+
+#[inline(never)]
+pub fn encode_reader_to_dir_with_progress<R, F>(
+    reader: R,
+    payload_len: u64,
+    out_dir: &Path,
+    password: Zeroizing<Vec<u8>>,
+    mut on_chunk_written: F,
+) -> Result<u32, Error>
+where
+    R: Read,
+    F: FnMut(u32, u32),
+{
+    if !out_dir.is_dir() {
+        return Err(Error::InvalidArgs);
+    }
 
     // Pre-compute the chunk count and refuse if any target file already
     // exists. Per SPEC.md: never silently overwrite.
-    let total_chunks = codec::compute_total_chunks(file_len, DEFAULT_CHUNK_RES)?;
+    let total_chunks = codec::compute_total_chunks(payload_len, DEFAULT_CHUNK_RES)?;
     for i in 0..total_chunks {
         let p = out_dir.join(chunk_filename(i));
         if p.exists() {
@@ -54,9 +70,7 @@ where
         }
     }
 
-    let in_file = File::open(in_path).map_err(Error::ReadIo)?;
-
-    let written = codec::encode_multi_streaming(in_file, file_len, password, |idx, total, png| {
+    let written = codec::encode_multi_streaming(reader, payload_len, password, |idx, total, png| {
         let p = out_dir.join(chunk_filename(idx));
         let mut f = OpenOptions::new()
             .write(true)
@@ -136,12 +150,65 @@ where
 }
 
 #[inline(never)]
+pub fn decode_dir_to_writer_with_progress<W, F>(
+    in_dir: &Path,
+    out: W,
+    password: Zeroizing<Vec<u8>>,
+    on_chunk_written: F,
+) -> Result<(), Error>
+where
+    W: Write,
+    F: FnMut(u32, u32),
+{
+    if !in_dir.is_dir() {
+        return Err(Error::InvalidArgs);
+    }
+
+    let pngs_data = read_pngs_from_dir(in_dir)?;
+    if pngs_data.is_empty() {
+        return Err(Error::Verification);
+    }
+    let png_refs: Vec<&[u8]> = pngs_data.iter().map(|v| v.as_slice()).collect();
+
+    // No create_new + shred wrapper here: the writer is owned by the caller
+    // (e.g. stdout). MAC verification still happens before any plaintext is
+    // emitted — phase 1 of decode_multi_streaming runs to completion before
+    // phase 3 begins writing — so a verification failure cannot leak partial
+    // plaintext to the writer.
+    codec::decode_multi_streaming(&png_refs, password, out, on_chunk_written)
+}
+
+#[inline(never)]
 pub fn decode_file_to_file(
     in_png: &Path,
     out_path: &Path,
     password: Zeroizing<Vec<u8>>,
 ) -> Result<(), Error> {
     decode_file_to_file_with_progress(in_png, out_path, password, |_, _| {})
+}
+
+#[inline(never)]
+pub fn decode_file_to_writer_with_progress<W, F>(
+    in_png: &Path,
+    out: W,
+    password: Zeroizing<Vec<u8>>,
+    on_chunk_written: F,
+) -> Result<(), Error>
+where
+    W: Write,
+    F: FnMut(u32, u32),
+{
+    if !in_png.is_file() {
+        return Err(Error::InvalidArgs);
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut f = File::open(in_png).map_err(Error::ReadIo)?;
+    f.read_to_end(&mut buf).map_err(Error::ReadIo)?;
+    let png_data = Zeroizing::new(buf);
+    let pngs: [&[u8]; 1] = [png_data.as_slice()];
+
+    codec::decode_multi_streaming(&pngs[..], password, out, on_chunk_written)
 }
 
 #[inline(never)]
